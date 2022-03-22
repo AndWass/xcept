@@ -1,6 +1,5 @@
 use std::hint::unreachable_unchecked;
 use std::marker::PhantomData;
-use crate::context::PopHandlingContextGuard;
 
 pub mod context;
 
@@ -76,10 +75,11 @@ where
     E: Error,
 {
     let mut error_storage: Option<(u32, E)> = None;
-    unsafe { context::push_handling_context(&mut error_storage) };
-    let pop_guard = PopHandlingContextGuard;
+    let mut scope = context::ScopeNode::new(&mut error_storage);
+    // Safety: scope is kept alive, guard is dropped before `scope` is used again
+    let guard = unsafe { context::push_handling_scope(&mut scope) };
     let res = func();
-    drop(pop_guard);
+    drop(guard);
     if let Some(error_id) = res.error_id() {
         match error_storage {
             Some((stored_error_id, err)) if stored_error_id == error_id => handler(err),
@@ -118,5 +118,11 @@ mod tests
 
         assert!(!called);
         assert!(x.is_error());
+    }
+
+    #[test]
+    fn error_without_scopes() {
+        let res: crate::Result<i32> = crate::Result::report_error(true);
+        assert!(res.is_error());
     }
 }

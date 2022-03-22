@@ -1,6 +1,6 @@
 use std::any::TypeId;
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::ops::DerefMut;
 use std::thread_local;
 
 pub struct ReportedError
@@ -8,6 +8,16 @@ pub struct ReportedError
     pub id: u32,
     pub type_id: TypeId,
     pub value: *mut (),
+}
+
+impl ReportedError {
+    fn new<E: crate::Error>(id: u32, err: &mut E) -> Self {
+        Self {
+            id,
+            type_id: TypeId::of::<E>(),
+            value: err as *const _ as *mut (),
+        }
+    }
 }
 
 /// The result of `ErrorHandlingContext.try_set_error`
@@ -52,7 +62,7 @@ impl<T: crate::Error> ErrorHandlingContext for Option<(u32, T)>
     }
 }
 
-struct CatchAllContext
+pub struct CatchAllContext
 {
     pub inner: Option<(u32, TypeId)>
 }
@@ -67,27 +77,29 @@ impl ErrorHandlingContext for CatchAllContext {
 struct HandlingScopes
 {
     error_id: u32,
-    scopes: VecDeque<HandlingScope>
+    scopes: *mut ScopeNode
 }
 
 impl HandlingScopes {
     fn new() -> Self {
         Self {
             error_id: 0,
-            scopes: VecDeque::new()
+            scopes: core::ptr::null_mut(),
         }
     }
 }
 
-struct HandlingScope
+pub struct ScopeNode
 {
-    context: *mut dyn ErrorHandlingContext
+    context: *mut dyn ErrorHandlingContext,
+    next: *mut ScopeNode,
 }
 
-impl HandlingScope {
-    fn new(context: &mut dyn ErrorHandlingContext) -> Self {
+impl ScopeNode {
+    pub fn new(context: &mut dyn ErrorHandlingContext) -> Self {
         Self {
-            context
+            context,
+            next: core::ptr::null_mut(),
         }
     }
 
@@ -100,41 +112,69 @@ thread_local! {
     static CONTEXTS: RefCell<HandlingScopes> = RefCell::new(HandlingScopes::new());
 }
 
-pub unsafe fn push_handling_context(handling_context: &mut dyn ErrorHandlingContext) {
-    CONTEXTS.with(|contexts| {
+/// Push a new error handling scope to the list of scopes
+///
+/// # Safety
+///
+/// The following requirements must be met:
+///
+///   * No references to `scope` must be created after this function returns.
+///     * When the returned guard is dropped it is safe to reference `scope` again.
+///   * `scope` must be kept alive until the guard is dropped
+///   * The context that `scope` refers to must be kept alive until the guard is dropped
+///   * The returned guard must be dropped, it must not be forgotten.
+///
+pub unsafe fn push_handling_scope(scope: &mut ScopeNode) -> PopScopeGuard {
+    CONTEXTS.with(move |contexts| {
         let mut ctx = contexts.borrow_mut();
-        ctx.scopes.push_front(HandlingScope::new(handling_context));
-    });
-}
-
-pub unsafe fn pop_handling_context() {
-    CONTEXTS.with(|contexts| {
-        let mut ctx = contexts.borrow_mut();
-        ctx.scopes.pop_front();
+        scope.next = ctx.scopes;
+        ctx.scopes = scope;
+        PopScopeGuard(scope)
     })
 }
 
-pub struct PopHandlingContextGuard;
+/// Pop a scope from the list of error handling scopes
+///
+/// # Safety
+///
+/// Scope must previously have been pushed, and never been popped before.
+///
+unsafe fn pop_handling_scope(scope: *mut ScopeNode) {
+    CONTEXTS.with(move |contexts| {
+        let mut ctx = contexts.borrow_mut();
+        ctx.scopes = (*scope).next;
+    })
+}
 
-impl Drop for PopHandlingContextGuard {
+/// Scope guard to automatically pop a scope when it is destroyed.
+///
+/// This is created by pushing scopes and then manually dropping the guard.
+pub struct PopScopeGuard(*mut ScopeNode);
+
+impl Drop for PopScopeGuard {
     fn drop(&mut self) {
-        unsafe { pop_handling_context() };
+        // Safety: the guard is only created by `push_handling_scope`
+        // and the safety guarantees required by that function extends to the guard
+        unsafe { pop_handling_scope(self.0) }
     }
+}
+
+unsafe fn try_scope(scope: *mut ScopeNode, err: &ReportedError) -> TrySetErrorResult {
+    (*scope).context().try_set_error(err)
 }
 
 pub fn push_error<E: crate::Error>(mut err: E) -> u32 {
     CONTEXTS.with(move |contexts| {
         let mut ctx = contexts.borrow_mut();
-        ctx.error_id = ctx.error_id.wrapping_add(1);
-        let reported_error = ReportedError {
-            id: ctx.error_id,
-            type_id: TypeId::of::<E>(),
-            value: &mut err as *mut _ as *mut (),
-        };
+        let ctx = ctx.deref_mut();
 
-        for x in ctx.scopes.iter_mut() {
-            let context = unsafe { x.context() };
-            match unsafe { context.try_set_error(&reported_error) } {
+        ctx.error_id = ctx.error_id.wrapping_add(1);
+        let reported_error = ReportedError::new(ctx.error_id, &mut err);
+
+        // Safety: All scopes must be kept alive by the contract of push and pop scope
+        let mut iter = ctx.scopes;
+        while !iter.is_null() {
+            match unsafe { try_scope(iter, &reported_error) } {
                 // SAFETY: We must ensure to forget err if we end up here!
                 TrySetErrorResult::NeedForget => {
                     std::mem::forget(err);
@@ -146,6 +186,7 @@ pub fn push_error<E: crate::Error>(mut err: E) -> u32 {
                 },
                 _ => {}
             }
+            iter = unsafe { (*iter).next }
         }
         reported_error.id
     })

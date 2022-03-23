@@ -1,3 +1,12 @@
+# except
+
+A very early Rust proof of concept inspired by [`boost.LEAF`].
+
+  [`boost.LEAF`]: https://www.boost.org/doc/libs/1_78_0/libs/leaf/doc/html/index.html
+
+## Hello world
+
+```rust
 #[derive(Debug)]
 struct CustomError(i32);
 
@@ -32,3 +41,4 @@ fn main() {
     let y = xcept::try_or_handle_one(|| hello_world(3), error_handler);
     println!("{}", y.unwrap());
 }
+```

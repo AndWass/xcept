@@ -5,6 +5,9 @@ use std::marker::PhantomData;
 pub mod context;
 pub mod multihandler;
 
+pub use multihandler::builder;
+pub use multihandler::try_or_handle;
+
 /// Marker trait for error compatible types
 ///
 /// This is blanket implemented for all types that satisfies it.
@@ -45,6 +48,24 @@ impl<T> Result<T> {
         }
     }
 
+    /// Create a new `Result` holding an error, identified by `id`
+    ///
+    /// This should generally not be used, but for can be useful for those wishing to implement
+    /// custom `try_handle` functions.
+    ///
+    /// # Arguments
+    ///
+    /// * `id`: The ID of the error it holds
+    ///
+    /// returns: `Result<T>`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let res = xcept::Result::new_with_error_id(1);
+    /// assert_eq!(res.error_id().unwrap(), 1);
+    /// ```
+    ///
     #[inline]
     pub fn new_with_error_id(id: u32) -> Self {
         Self {
@@ -176,6 +197,8 @@ impl<T, E: Error> From<std::result::Result<T, E>> for Result<T> {
 
 /// Try to execute a function, and try to handle an error, if one occurs.
 ///
+/// Use [`try_or_handle`] to handle multiple error types.
+///
 /// # Arguments
 ///
 /// * `func`: The function to execute
@@ -213,56 +236,6 @@ where
     if res.is_error() {
         // Safety: res.is_error() is true
         unsafe { error_storage.unchecked_try_handle(res, handler) }
-    } else {
-        res
-    }
-}
-
-/// Try to execute a function, and try to handle any error that happens.
-///
-/// Unlike `try_or_handle_one` this function can handle multiple different error types, but
-/// the error handler must be built using a builder.
-///
-/// # Examples
-///
-/// ```
-/// fn to_int(string: &str) -> xcept::Result<i32> {
-///     if string.is_empty() {
-///         xcept::Result::new_error("Empty")
-///     }
-///     else {
-///         string.parse().into()
-///     }
-/// }
-///
-/// type ErrorT = <i32 as std::str::FromStr>::Err;
-/// let handlers = xcept::multihandler::builder(|_: ErrorT| xcept::Result::new(-1))
-///     .handle(|s: &str| {
-///         println!("Error: {}", s);
-///         xcept::Result::new(-2)
-///     })
-///     .build();
-/// let res = xcept::try_or_handle(|| to_int("abc"), handlers.clone());
-/// assert_eq!(res.unwrap(), -1);
-///
-/// let res = xcept::try_or_handle(|| to_int(""), handlers.clone());
-/// assert_eq!(res.unwrap(), -2);
-/// ```
-#[inline]
-pub fn try_or_handle<F, H, T>(func: F, mut handlers: H) -> Result<T>
-where
-    F: FnOnce() -> Result<T>,
-    H: multihandler::TryHandle<Value = T> + context::ErrorHandlingContext,
-{
-    let mut scope = context::ScopeNode::new(&mut handlers);
-    let guard = unsafe { context::push_handling_scope(&mut scope) };
-    let res = func();
-    drop(guard);
-    if res.is_error() {
-        match handlers.try_handle(unsafe { res.unchecked_error_id() }) {
-            None => res,
-            Some(x) => x,
-        }
     } else {
         res
     }

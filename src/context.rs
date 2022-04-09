@@ -33,7 +33,7 @@ pub enum TrySetErrorResult
     NeedDrop,
 }
 
-pub trait ErrorHandlingContext: 'static
+pub trait ErrorHandlingContext
 {
     /// Try to store the error into a handling context
     ///
@@ -49,11 +49,58 @@ pub trait ErrorHandlingContext: 'static
     unsafe fn try_set_error(&mut self, error: &ReportedError) -> TrySetErrorResult;
 }
 
-impl<T: crate::Error> ErrorHandlingContext for Option<(u32, T)>
+#[derive(Copy, Clone)]
+pub struct SingleErrorStorage<T>
+{
+    inner: Option<(u32, T)>
+}
+
+impl<T> Default for SingleErrorStorage<T> {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            inner: None
+        }
+    }
+}
+
+impl<T> SingleErrorStorage<T> {
+    #[inline(always)]
+    pub fn into_inner(self) -> Option<(u32, T)> {
+        self.inner
+    }
+}
+
+impl<T: crate::Error> SingleErrorStorage<T> {
+    #[inline]
+    pub fn try_handle<V>(self, error: crate::Result<V>, handler: impl FnOnce(T) -> crate::Result<V>) -> crate::Result<V> {
+        if !error.is_error() {
+            return error;
+        }
+
+        // Safety: checked access
+        unsafe { self.unchecked_try_handle(error, handler) }
+    }
+
+    /// Unchecked version of `try_handle`.
+    ///
+    /// # Safety
+    ///
+    /// `error.is_error()` must return true.
+    #[inline]
+    pub unsafe fn unchecked_try_handle<V>(self, error: crate::Result<V>, handler: impl FnOnce(T) -> crate::Result<V>) -> crate::Result<V> {
+        match self.inner {
+            Some((id, err)) if id == error.unchecked_error_id() => handler(err),
+            _ => error,
+        }
+    }
+}
+
+impl<T: crate::Error> ErrorHandlingContext for SingleErrorStorage<T>
 {
     unsafe fn try_set_error(&mut self, error: &ReportedError) -> TrySetErrorResult {
         if TypeId::of::<T>() == error.type_id {
-            *self = Some((error.id, (error.value as *mut T).read()));
+            self.inner = Some((error.id, (error.value as *mut T).read()));
             TrySetErrorResult::NeedForget
         }
         else {
@@ -91,20 +138,26 @@ impl HandlingScopes {
 
 pub struct ScopeNode
 {
-    context: *mut dyn ErrorHandlingContext,
+    context: *mut (),
+    try_set_error: unsafe fn(*mut (), &ReportedError) -> TrySetErrorResult,
     next: *mut ScopeNode,
 }
 
+unsafe fn try_set_error_impl<Ctx: ErrorHandlingContext>(ctx: *mut (), error: &ReportedError) -> TrySetErrorResult {
+    (*(ctx as *mut Ctx)).try_set_error(error)
+}
+
 impl ScopeNode {
-    pub fn new(context: &mut dyn ErrorHandlingContext) -> Self {
+    pub fn new<Ctx: ErrorHandlingContext>(context: &mut Ctx) -> Self {
         Self {
-            context,
+            context: context as *mut _ as *mut (),
+            try_set_error: try_set_error_impl::<Ctx>,
             next: core::ptr::null_mut(),
         }
     }
 
-    unsafe fn context(&mut self) -> &mut dyn ErrorHandlingContext {
-        &mut *self.context
+    unsafe fn try_set_error(&mut self, error: &ReportedError) -> TrySetErrorResult {
+        (self.try_set_error)(self.context, error)
     }
 }
 
@@ -160,7 +213,7 @@ impl Drop for PopScopeGuard {
 }
 
 unsafe fn try_scope(scope: *mut ScopeNode, err: &ReportedError) -> TrySetErrorResult {
-    (*scope).context().try_set_error(err)
+    (*scope).try_set_error(err)
 }
 
 pub fn push_error<E: crate::Error>(mut err: E) -> u32 {

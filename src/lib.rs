@@ -1,7 +1,9 @@
+use crate::context::SingleErrorStorage;
 use std::hint::unreachable_unchecked;
 use std::marker::PhantomData;
 
 pub mod context;
+pub mod multihandler;
 
 /// Marker trait for error compatible types
 ///
@@ -43,6 +45,14 @@ impl<T> Result<T> {
         }
     }
 
+    #[inline]
+    pub fn new_with_error_id(id: u32) -> Self {
+        Self {
+            value: Err(id),
+            _not_send: PhantomData,
+        }
+    }
+
     /// Create a new `Result` with an error indication.
     ///
     /// The error is not held within `Result`, but is directly assigned to the nearest handler,
@@ -64,7 +74,10 @@ impl<T> Result<T> {
     #[inline]
     pub fn new_error<E: Error>(err: E) -> Self {
         let id = context::push_error(err);
-        Self { value:  Err(id), _not_send: PhantomData }
+        Self {
+            value: Err(id),
+            _not_send: PhantomData,
+        }
     }
 
     /// Test if a `Result` contains a value.
@@ -191,35 +204,81 @@ where
     H: FnOnce(E) -> Result<T>,
     E: Error,
 {
-    let mut error_storage: Option<(u32, E)> = None;
+    let mut error_storage: crate::context::SingleErrorStorage<E> = SingleErrorStorage::default();
     let mut scope = context::ScopeNode::new(&mut error_storage);
     // Safety: scope is kept alive, guard is dropped before `scope` is used again
     let guard = unsafe { context::push_handling_scope(&mut scope) };
     let res = func();
     drop(guard);
-    if let Some(error_id) = res.error_id() {
-        match error_storage {
-            Some((stored_error_id, err)) if stored_error_id == error_id => handler(err),
-            _ => res
-        }
+    if res.is_error() {
+        // Safety: res.is_error() is true
+        unsafe { error_storage.unchecked_try_handle(res, handler) }
+    } else {
+        res
     }
-    else {
+}
+
+/// Try to execute a function, and try to handle any error that happens.
+///
+/// Unlike `try_or_handle_one` this function can handle multiple different error types, but
+/// the error handler must be built using a builder.
+///
+/// # Examples
+///
+/// ```
+/// fn to_int(string: &str) -> xcept::Result<i32> {
+///     if string.is_empty() {
+///         xcept::Result::new_error("Empty")
+///     }
+///     else {
+///         string.parse().into()
+///     }
+/// }
+///
+/// type ErrorT = <i32 as std::str::FromStr>::Err;
+/// let handlers = xcept::multihandler::builder(|_: ErrorT| xcept::Result::new(-1))
+///     .handle(|s: &str| {
+///         println!("Error: {}", s);
+///         xcept::Result::new(-2)
+///     })
+///     .build();
+/// let res = xcept::try_or_handle(|| to_int("abc"), handlers.clone());
+/// assert_eq!(res.unwrap(), -1);
+///
+/// let res = xcept::try_or_handle(|| to_int(""), handlers.clone());
+/// assert_eq!(res.unwrap(), -2);
+/// ```
+#[inline]
+pub fn try_or_handle<F, H, T>(func: F, mut handlers: H) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+    H: multihandler::TryHandle<Value = T> + context::ErrorHandlingContext,
+{
+    let mut scope = context::ScopeNode::new(&mut handlers);
+    let guard = unsafe { context::push_handling_scope(&mut scope) };
+    let res = func();
+    drop(guard);
+    if res.is_error() {
+        match handlers.try_handle(unsafe { res.unchecked_error_id() }) {
+            None => res,
+            Some(x) => x,
+        }
+    } else {
         res
     }
 }
 
 #[cfg(test)]
-mod tests
-{
+mod tests {
+    use std::cell::RefCell;
+
     #[test]
     fn try_or_handle_one() {
         fn func() -> crate::Result<i32> {
             crate::Result::new_error(true)
         }
 
-        let x = crate::try_or_handle_one(func, |_e: bool| {
-            1.into()
-        }).unwrap();
+        let x = crate::try_or_handle_one(func, |_e: bool| 1.into()).unwrap();
         assert_eq!(x, 1);
 
         fn two_errors() -> crate::Result<i32> {
@@ -241,5 +300,63 @@ mod tests
     fn error_without_scopes() {
         let res: crate::Result<i32> = crate::Result::new_error(true);
         assert!(res.is_error());
+    }
+
+    #[test]
+    fn multi_handlers() {
+        fn handler1(e: i32) -> crate::Result<i32> {
+            (e * 2).into()
+        }
+        fn handler2(_e: &str) -> crate::Result<i32> {
+            (-1).into()
+        }
+        fn handler3(_e: bool) -> crate::Result<i32> {
+            crate::Result::new_error("Bool not supported!")
+        }
+        let handlers = crate::multihandler::builder(handler1)
+            .handle(handler2)
+            .handle(handler3)
+            .build();
+
+        let res = crate::try_or_handle(|| 10.into(), handlers.clone());
+
+        assert_eq!(res.unwrap(), 10);
+
+        let res = crate::try_or_handle(|| crate::Result::new_error(15), handlers.clone());
+
+        assert_eq!(res.unwrap(), 30);
+
+        let res = crate::try_or_handle(
+            || crate::Result::new_error("should be -1"),
+            handlers.clone(),
+        );
+
+        assert_eq!(res.unwrap(), -1);
+
+        let res = crate::try_or_handle(|| crate::Result::new_error(false), handlers.clone());
+
+        assert_eq!(res.is_error(), true);
+    }
+
+    #[test]
+    fn multi_handlers_with_refs() {
+        let which = RefCell::new(0);
+        let handlers = crate::multihandler::builder(|_: i32| {
+            *which.borrow_mut() = 1;
+            crate::Result::new(1)
+        })
+        .handle(|_: &str| {
+            *which.borrow_mut() = 2;
+            crate::Result::new(2)
+        })
+        .build();
+
+        let res = crate::try_or_handle(|| crate::Result::new_error(0), handlers.clone());
+        assert_eq!(res.unwrap(), 1);
+        assert_eq!(*which.borrow(), 1);
+
+        let res = crate::try_or_handle(|| crate::Result::new_error("hello"), handlers.clone());
+        assert_eq!(res.unwrap(), 2);
+        assert_eq!(*which.borrow(), 2);
     }
 }

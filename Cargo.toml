@@ -1,7 +1,12 @@
 [package]
 name = "xcept"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
+license = "MIT/Apache-2.0"
+repository = "https://github.com/AndWass/xcept"
+description = "Handle errors more like exceptions"
+keywords = ["error", "result", "exception", "error-handling"]
+readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
